@@ -1,0 +1,8 @@
+fonttools==4.67.0
+matplotlib==3.11.2
+numpy==2.5.4
+pillow==13.0.0
+PyInstaller==6.22.3
+PyQt5==5.15.11
+pyserial==3.5
+scipy==1.18.1
