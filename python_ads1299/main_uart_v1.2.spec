@@ -2,7 +2,9 @@
 
 import os
 
-ICON_PATH = os.path.abspath(os.path.join(os.getcwd(), 'python_ads1299', 'mouse.ico'))
+ICON_PATH = os.path.join(SPECPATH, 'mouse.ico')
+if not os.path.isfile(ICON_PATH):
+    ICON_PATH = None
 
 a = Analysis(
     ['main_uart_v1.2.py'],

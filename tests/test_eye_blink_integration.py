@@ -147,6 +147,7 @@ class EyeBlinkCounterWindowTests(unittest.TestCase):
             window._update_eye_blink_status()
             window.eye_blink_reset_timer.start(180_000)
             window.serial_port = type("SerialStub", (), {"is_open": True})()
+            window.subject_info = {"kind": "person", "name": "测试者", "age": 30}
             with patch.object(window, "send_binary_command", return_value=True), patch.object(
                 window.eye_blink_detector, "reset"
             ) as reset:

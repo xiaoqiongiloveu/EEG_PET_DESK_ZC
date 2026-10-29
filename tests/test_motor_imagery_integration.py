@@ -180,6 +180,7 @@ class MotorImageryMainWindowTests(unittest.TestCase):
         window.serial_port.chunks = [eeg_frame((10.0,) * 8)]
         self.update_once(window)
         self.assertEqual(dialog.samples, [])
+        window.subject_info = {"kind": "person", "name": "测试者", "age": 30}
         with patch.object(window, "send_binary_command", return_value=True):
             window.start_collect()
         self.assertTrue(dialog.active)
@@ -219,6 +220,7 @@ class MotorImageryMainWindowTests(unittest.TestCase):
         window.serial_port = SerialStub()
         window.open_motor_imagery()
         dialog = window.motor_imagery_dialog
+        window.subject_info = {"kind": "person", "name": "测试者", "age": 30}
         with patch.object(window, "send_binary_command", return_value=False):
             window.start_collect()
         self.assertFalse(window.is_collecting)

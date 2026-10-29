@@ -1,31 +1,34 @@
-import csv
 import datetime
 import sys
 import time
-from numbers import Real
 
 import numpy as np
 import logging
 import serial
 from serial.tools import list_ports
-from PyQt5.QtCore import QSignalBlocker, QTimer, Qt
+from PyQt5.QtCore import QSettings, QSignalBlocker, QStandardPaths, QTimer, Qt, pyqtSignal
 from PyQt5.QtGui import QFont, QFontMetrics
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
+    QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressDialog,
     QPushButton,
     QSlider,
+    QSpinBox,
     QSizePolicy,
     QSpacerItem,
     QVBoxLayout,
@@ -44,6 +47,7 @@ from eye_blink import EyeBlinkDetector
 from history_replay import alpha_activity_mask, read_history_csv, sample_rate_from_filename
 from ring_buffer import MultiChannelRingBuffer
 from link_stats import StreamLossTracker
+from csv_recording import CsvExportWorker, SegmentedCsvRecorder, subject_filename_prefix
 
 # 基本日志配置，便于调试串口与数据解析问题
 logging.basicConfig(
@@ -111,8 +115,86 @@ class SerialLogDialog(QDialog):
             QMessageBox.critical(self, "保存失败", f"无法保存日志：\n{exc}")
 
 
+class SubjectDialog(QDialog):
+    """采集前录入被采集者；采集时间由主窗口在真正开始时确定。"""
+
+    def __init__(self, parent=None, subject=None):
+        super().__init__(parent)
+        self.setWindowTitle("被采集者信息")
+        form = QFormLayout(self)
+        self.kind = QComboBox(self)
+        self.kind.addItem("请选择采集类型", None)
+        self.kind.addItem("人的采集", "person")
+        self.kind.addItem("宠物的采集", "pet")
+        self.name = QLineEdit(self)
+        self.age = QSpinBox(self)
+        self.age.setRange(-1, 150)
+        self.age.setSpecialValueText("未填写")
+        self.age.setSuffix(" 岁")
+        self.age.setValue(-1)
+        self.weight = QDoubleSpinBox(self)
+        self.weight.setRange(0.0, 500.0)
+        self.weight.setSpecialValueText("未填写")
+        self.weight.setDecimals(2)
+        self.weight.setSuffix(" kg")
+        self.time_label = QLabel(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), self)
+        form.addRow("采集类型", self.kind)
+        self.name_label = QLabel("姓名", self)
+        form.addRow(self.name_label, self.name)
+        form.addRow("年龄", self.age)
+        self.weight_label = QLabel("体重", self)
+        form.addRow(self.weight_label, self.weight)
+        form.addRow("采集时间", self.time_label)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
+        buttons.accepted.connect(self._accept_validated)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+        self.kind.currentIndexChanged.connect(self._update_kind)
+        if subject:
+            self.kind.setCurrentIndex(self.kind.findData(subject["kind"]))
+            self.name.setText(subject["name"])
+            self.age.setValue(subject["age"])
+            if subject["kind"] == "pet":
+                self.weight.setValue(subject["weight"])
+        self._update_kind()
+
+    def _update_kind(self):
+        pet = self.kind.currentData() == "pet"
+        self.name_label.setText("名称" if pet else "姓名")
+        self.weight_label.setVisible(pet)
+        self.weight.setVisible(pet)
+
+    def _accept_validated(self):
+        if self.kind.currentData() is None:
+            QMessageBox.warning(self, "提示", "请选择人的采集或宠物的采集")
+            return
+        if not self.name.text().strip():
+            QMessageBox.warning(self, "提示", "请输入姓名或名称")
+            return
+        if self.age.value() < 0:
+            QMessageBox.warning(self, "提示", "请输入年龄")
+            return
+        if self.kind.currentData() == "pet" and self.weight.value() <= 0:
+            QMessageBox.warning(self, "提示", "请输入宠物体重")
+            return
+        self.accept()
+
+    def subject(self):
+        result = {
+            "kind": self.kind.currentData(),
+            "name": self.name.text().strip(),
+            "age": self.age.value(),
+        }
+        if result["kind"] == "pet":
+            result["weight"] = self.weight.value()
+        return result
+
+
 class MainWindow(QMainWindow):
     """脑电八通道实时波形显示主窗口。"""
+
+    recording_path = pyqtSignal(object, str)
+    recording_error = pyqtSignal(object, str)
 
     def __init__(self):
         super().__init__()
@@ -126,6 +208,25 @@ class MainWindow(QMainWindow):
         self.motor_imagery_dialog = None
         self.rhythm_analysis_dialog = None
         self.serial_log_entries = []
+        self.record_settings = QSettings("EEG_PET_DESK_ZC", "Recording")
+        self.record_directory = self.record_settings.value(
+            "directory", QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
+            + "/EEG_Records", type=str,
+        )
+        self._recorder = None
+        self._record_token = None
+        self._record_cursor = 0
+        self._record_error_reported = False
+        self.recorded_files = []
+        self.subject_info = None
+        self.collection_subject = None
+        self.collection_started_at = None
+        self._export_worker = None
+        self._export_progress = None
+        self._closing_window = False
+        self._record_summary_dialog = None
+        self.recording_path.connect(self._on_recording_path)
+        self.recording_error.connect(self._on_recording_error)
         self._link = StreamLossTracker(250)
         self._device_ready = False
         self._ready_deadline = 0.0
@@ -289,6 +390,15 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
         self.btn_stop.setMinimumHeight(self.control_height)
 
+        self.btn_subject = QPushButton("录入被采集者信息", self)
+        self.btn_subject.clicked.connect(self.edit_subject)
+        self.btn_subject.setMinimumHeight(self.control_height)
+
+        self.btn_record = QPushButton("开始保存数据", self)
+        self.btn_record.clicked.connect(self.toggle_recording)
+        self.btn_record.setEnabled(False)
+        self.btn_record.setMinimumHeight(self.control_height)
+
         self.btn_filter = QPushButton("带通滤波", self)
         self.btn_filter.setObjectName("filterButton")
         self.btn_filter.setCheckable(True)
@@ -451,6 +561,37 @@ class MainWindow(QMainWindow):
         self.waveform_mode_title = QLabel("EEG 实时波形", self)
         top_bar.addWidget(self.waveform_mode_title)
         right_vbox.addLayout(top_bar)
+
+        subject_row = QHBoxLayout()
+        subject_row.addWidget(self.btn_subject)
+        self.subject_status_label = QLabel("未录入被采集者信息", self)
+        subject_row.addWidget(self.subject_status_label)
+        subject_row.addStretch(1)
+        subject_row.addWidget(self.btn_record)
+        right_vbox.addLayout(subject_row)
+
+        record_row = QHBoxLayout()
+        self.btn_record_directory = QPushButton("选择保存目录", self)
+        self.btn_record_directory.clicked.connect(self.select_record_directory)
+        self.btn_record_directory.setToolTip(self.record_directory)
+        record_row.addWidget(self.btn_record_directory)
+        record_row.addWidget(QLabel("每段时长：", self))
+        self.record_seconds = QSpinBox(self)
+        self.record_seconds.setRange(1, 86400)
+        self.record_seconds.setSuffix(" 秒")
+        self.record_seconds.setValue(self.record_settings.value("segment_seconds", 300, type=int))
+        record_row.addWidget(self.record_seconds)
+        record_row.addWidget(QLabel("每段行数上限：", self))
+        self.record_max_rows = QSpinBox(self)
+        self.record_max_rows.setRange(0, 100000000)
+        self.record_max_rows.setSpecialValueText("不限行数")
+        self.record_max_rows.setValue(self.record_settings.value("max_rows", 0, type=int))
+        self.record_max_rows.setToolTip("时长与行数任一达到上限即切分；0 表示只按时长切分")
+        record_row.addWidget(self.record_max_rows)
+        self.record_seconds.valueChanged.connect(self._save_record_limits)
+        self.record_max_rows.valueChanged.connect(self._save_record_limits)
+        record_row.addStretch(1)
+        right_vbox.addLayout(record_row)
 
         band_row = QHBoxLayout()
         band_row.setSpacing(6)
@@ -622,6 +763,9 @@ class MainWindow(QMainWindow):
         self.stats_timer.timeout.connect(self._update_link_display)
         self.stats_timer.start()
         self.link_status_label = QLabel("链路：未连接", self)
+        self.record_status_label = QLabel("自动记录：待采集", self)
+        self.record_status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.statusBar().addPermanentWidget(self.record_status_label, 1)
         self.statusBar().addPermanentWidget(self.link_status_label)
 
         self.refresh_ports()
@@ -1401,8 +1545,10 @@ class MainWindow(QMainWindow):
         return True
 
     def _abort_stream_start(self):
+        self._finish_auto_recording()
         self._starting_stream = False
         self.is_collecting = False
+        self.btn_record.setEnabled(False)
         self.btn_start.setText("▶ 开始采集")
         self.btn_stop.setEnabled(False)
         if self.alpha_model_dialog is not None:
@@ -1461,6 +1607,7 @@ class MainWindow(QMainWindow):
         self.btn_start.setText("▶ 开始采集")
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(False)
+        self.btn_record.setEnabled(False)
         self.btn_impedance.setEnabled(False)
         self.port_combo.setEnabled(True)
         self.btn_refresh.setEnabled(True)
@@ -1516,9 +1663,12 @@ class MainWindow(QMainWindow):
             return
 
         self._shutdown_device()
+        was_collecting = self.is_collecting
         self.is_collecting = False
         self.is_impedance_testing = False
         self.stop_collection()
+        if was_collecting:
+            self._reset_subject_for_next_session()
         self.stop_impedance_test()
         try:
             self.serial_port.close()
@@ -1676,12 +1826,18 @@ class MainWindow(QMainWindow):
 
     def start_collect(self):
         """切换开始或停止采集状态。"""
+        if not self.is_collecting and self.subject_info is None:
+            QMessageBox.warning(self, "提示", "未录入被采集者信息")
+            return
         if self.serial_port is None or not self.serial_port.is_open:
             QMessageBox.warning(self, "提示", "请先打开串口。")
             return
 
         if self.is_impedance_testing:
             QMessageBox.warning(self, "提示", "请先停止阻抗检测，再开始 EEG 采集。")
+            return
+
+        if self.is_history_mode:
             return
 
         if not self.is_collecting:
@@ -1718,6 +1874,12 @@ class MainWindow(QMainWindow):
                 return
             self.eye_blink_detector.reset()
             self.is_collecting = True
+            self.collection_subject = dict(self.subject_info)
+            self.collection_started_at = datetime.datetime.now()
+            self.recorded_files = []
+            self.btn_subject.setEnabled(False)
+            self.btn_record.setEnabled(True)
+            self.record_status_label.setText("未保存数据")
             if self.alpha_model_dialog is not None:
                 self.alpha_model_dialog.start_session()
                 self.alpha_model_dialog.set_stream_active(True)
@@ -1732,6 +1894,11 @@ class MainWindow(QMainWindow):
 
     def stop_collection(self):
         """停止采集，但保留当前缓存数据用于显示和导出。"""
+        was_collecting = self.is_collecting
+        self._finish_auto_recording()
+        self.btn_record.setEnabled(False)
+        if was_collecting:
+            self._reset_subject_for_next_session()
         if self.alpha_model_dialog is not None:
             self.alpha_model_dialog.set_stream_active(False, "采集已停止，模型已冻结")
         if self.motor_imagery_dialog is not None:
@@ -1751,6 +1918,12 @@ class MainWindow(QMainWindow):
         if hasattr(self, "btn_start"):
             self.btn_start.setText("▶ 开始采集")
             self.btn_stop.setEnabled(False)
+
+    def _reset_subject_for_next_session(self):
+        # 已采数据仍保留本次身份供手动导出，下次采集需要重新核对被采集者。
+        self.subject_info = None
+        self.subject_status_label.setText("未录入被采集者信息")
+        self.btn_subject.setEnabled(True)
 
     def _reset_filter_runtime(self):
         """清空滤波输出与IIR历史状态，但不改变按钮开关状态。"""
@@ -1834,6 +2007,10 @@ class MainWindow(QMainWindow):
 
     def _filter_settings_changed(self, *_args):
         """参数改变后重算现有数据，并继续使用新的滤波器状态。"""
+        # 先保存旧数据源的尾批，切换后只记录此后的采样，避免重算导致重复行。
+        if self._recorder is not None:
+            self._append_new_filtered_data()
+            self._record_new_samples()
         low, high = self.low_cutoff.value(), self.high_cutoff.value()
         if low >= high:
             if self.sender() is self.low_cutoff:
@@ -2237,6 +2414,8 @@ class MainWindow(QMainWindow):
     def update_show(self):
         """定时读取串口缓存、解析数据、执行可选滤波并刷新波形。"""
         if self.serial_port is None or not self.serial_port.is_open:
+            if self._recorder is not None:
+                self._handle_serial_disconnect()
             return
 
         payload = bytearray()
@@ -2284,6 +2463,7 @@ class MainWindow(QMainWindow):
 
         # 只对新追加的数据滤波，不能每100 ms重复处理全部历史缓存。
         self._append_new_filtered_data()
+        self._record_new_samples()
         data_source = self._current_data_source()
         plot_source, raw_source, sample_offset = self._live_plot_sources(
             data_source, self.AdsData.sample_rate,
@@ -2425,6 +2605,9 @@ class MainWindow(QMainWindow):
     def _handle_serial_disconnect(self):
         """串口异常断开后的界面复位。"""
         logger.warning("串口异常断开，界面将复位")
+        self._finish_auto_recording()
+        if self.is_collecting:
+            self._reset_subject_for_next_session()
         self.is_collecting = False
         if self.alpha_model_dialog is not None:
             self.alpha_model_dialog.set_stream_active(False, "串口已断开，模型已冻结")
@@ -2441,8 +2624,125 @@ class MainWindow(QMainWindow):
         self._reset_connection_ui()
         self.statusBar().showMessage("串口已断开，界面已复位", 3000)
 
+    def select_record_directory(self):
+        directory = QFileDialog.getExistingDirectory(
+            self, "选择 EEG 自动记录目录（按日期建立子目录）", self.record_directory,
+        )
+        if directory:
+            self.record_directory = directory
+            self.record_settings.setValue("directory", directory)
+            self.btn_record_directory.setToolTip(directory)
+
+    def edit_subject(self):
+        if self.is_collecting:
+            return
+        dialog = SubjectDialog(self, self.subject_info)
+        if dialog.exec_() == QDialog.Accepted:
+            self.subject_info = dialog.subject()
+            label = "宠物" if self.subject_info["kind"] == "pet" else "人"
+            self.subject_status_label.setText(f"{label}：{self.subject_info['name']}")
+
+    def toggle_recording(self):
+        if self._recorder is not None:
+            self._finish_auto_recording()
+            return
+        if not self.is_collecting or self.is_history_mode:
+            return
+        if not self.record_settings.contains("directory"):
+            self.select_record_directory()
+            self.record_settings.setValue("directory", self.record_directory)
+        self._start_auto_recording()
+
+    def _save_record_limits(self):
+        self.record_settings.setValue("segment_seconds", self.record_seconds.value())
+        self.record_settings.setValue("max_rows", self.record_max_rows.value())
+
+    def _start_auto_recording(self):
+        if not self.is_collecting or self.is_history_mode or self._recorder is not None:
+            return
+        self._append_new_filtered_data()
+        # 保存开关只控制此刻之后的数据，不能补写此前未选择保存的采样。
+        self._record_cursor = self._common_raw_length()
+        self._record_error_reported = False
+        token = self._record_token = object()
+        self._recorder = SegmentedCsvRecorder(
+            self.record_directory, self.record_seconds.value(), self.record_max_rows.value(),
+            on_path=lambda path: self.recording_path.emit(token, path),
+            on_error=lambda error: self.recording_error.emit(token, error),
+            started_at=self.collection_started_at, subject=self.collection_subject,
+        )
+        self.btn_record.setText("结束保存数据")
+        for widget in (self.btn_record_directory, self.record_seconds, self.record_max_rows):
+            widget.setEnabled(False)
+        self.record_status_label.setText("自动记录：等待采样")
+        self.record_status_label.setToolTip(self.record_directory)
+
+    def _record_new_samples(self):
+        if self._recorder is None or self.is_history_mode:
+            return
+        source = self._current_data_source()
+        length = min((len(channel) for channel in source), default=0)
+        while self._record_cursor < length:
+            end = min(length, self._record_cursor + 256)
+            rows = list(zip(*(channel[self._record_cursor:end] for channel in source)))
+            accepted = self._recorder.submit(
+                rows, self.AdsData.sample_rate,
+                "filtered" if self.filter_enabled else "raw", self.channel_names,
+            )
+            self._record_cursor = end
+            if not accepted:
+                break
+
+    def _on_recording_path(self, token, path):
+        if token is self._record_token and not self._record_error_reported:
+            self.record_status_label.setText(f"正在记录：{path}")
+            self.record_status_label.setToolTip(path)
+
+    def _on_recording_error(self, token, message):
+        if token is not self._record_token or self._record_error_reported:
+            return
+        self._record_error_reported = True
+        logger.error("自动记录失败，采集继续：%s", message)
+        self.record_status_label.setText("自动记录失败，采集继续")
+        self.record_status_label.setToolTip(message)
+        self.statusBar().showMessage(f"自动记录失败，采集继续：{message}", 10000)
+
+    def _finish_auto_recording(self):
+        recorder = self._recorder
+        if recorder is None:
+            return
+        self._append_new_filtered_data()
+        self._record_new_samples()
+        self.recorded_files.extend(recorder.close())
+        if recorder.error:
+            self._on_recording_error(self._record_token, recorder.error)
+        self._recorder = None
+        self._record_token = None
+        self.btn_record.setText("开始保存数据")
+        for widget in (self.btn_record_directory, self.record_seconds, self.record_max_rows):
+            widget.setEnabled(True)
+        summary = f"本次记录已结束，共 {len(self.recorded_files)} 个文件"
+        if recorder.error:
+            summary += "（记录失败，文件可能不完整）"
+        paths = "\n".join(self.recorded_files)
+        self.record_status_label.setText(summary + "（悬停查看分段列表）")
+        self.record_status_label.setToolTip(summary + "\n" + paths)
+        self.statusBar().showMessage(summary + "：" + "；".join(self.recorded_files), 15000)
+        logger.info("%s\n%s", summary, paths)
+        if self.isVisible() and not self._closing_window:
+            dialog = QMessageBox(self)
+            dialog.setWindowTitle("自动记录已结束")
+            dialog.setText(summary)
+            dialog.setDetailedText(paths or "本次没有收到采样数据")
+            dialog.setAttribute(Qt.WA_DeleteOnClose)
+            dialog.finished.connect(lambda: setattr(self, "_record_summary_dialog", None))
+            self._record_summary_dialog = dialog
+            dialog.show()
+
     def export_csv(self):
         """将当前显示的八通道原始或滤波数据导出为CSV。"""
+        if self._export_worker is not None:
+            return
         data_source = self.history_data if self.is_history_mode else self._current_data_source()
         if not any(len(channel) > 0 for channel in data_source):
             QMessageBox.information(self, "提示", "数据缓存区为空，请先采集数据！")
@@ -2452,7 +2752,9 @@ class MainWindow(QMainWindow):
         data_tag = "history" if self.is_history_mode else "filtered" if self.filter_enabled else "raw"
         sample_rate = self.history_rate if self.is_history_mode else self.AdsData.sample_rate
         default_name = (
-            now.strftime("%Y%m%d_%H%M%S")
+            (subject_filename_prefix(self.collection_subject, self.collection_started_at)
+             if not self.is_history_mode and self.collection_subject else
+             now.strftime("%Y%m%d_%H%M%S"))
             + "_"
             + str(sample_rate)
             + "sps_"
@@ -2471,41 +2773,54 @@ class MainWindow(QMainWindow):
         if not filepath.lower().endswith(".csv"):
             filepath += ".csv"
 
-        headers = self.channel_names
+        self._export_data_name = "历史数据" if self.is_history_mode else "滤波数据" if self.filter_enabled else "原始数据"
+        self.btn_export.setEnabled(False)
+        self._export_progress = QProgressDialog("正在导出 CSV…", "取消", 0, 100, self)
+        self._export_progress.setWindowTitle("导出 CSV")
+        self._export_progress.setWindowModality(Qt.NonModal)
+        self._export_progress.setMinimumDuration(0)
+        self._export_progress.setAutoClose(False)
+        self._export_progress.setAutoReset(False)
+        self._export_worker = CsvExportWorker(filepath, data_source, self.channel_names, self)
+        self._export_progress.canceled.connect(self._export_worker.requestInterruption)
+        self._export_worker.progress.connect(self._export_progress.setValue)
+        self._export_worker.finished.connect(self._finish_csv_export)
+        self._export_progress.show()
+        self._export_worker.start()
 
-        try:
-            with open(filepath, "w", newline="", encoding="utf-8-sig") as file:
-                writer = csv.writer(file)
-                writer.writerow(headers)
-
-                max_len = max(len(channel) for channel in data_source)
-                for row_index in range(max_len):
-                    row = []
-                    for channel_data in data_source:
-                        if row_index >= len(channel_data):
-                            row.append("")
-                            continue
-
-                        value = channel_data[row_index]
-                        if isinstance(value, Real):
-                            row.append(f"{float(value):.3f}")
-                        else:
-                            row.append("")
-                    writer.writerow(row)
-        except OSError as exc:
-            QMessageBox.critical(self, "导出失败", f"CSV文件写入失败：\n{exc}")
+    def _finish_csv_export(self):
+        worker = self._export_worker
+        if worker is None:
             return
-
-        data_name = "历史数据" if self.is_history_mode else "滤波数据" if self.filter_enabled else "原始数据"
-        QMessageBox.information(self, "提示", f"{data_name}导出成功！")
+        self._export_worker = None
+        self._export_progress.close()
+        self._export_progress.deleteLater()
+        self._export_progress = None
+        self.btn_export.setEnabled(True)
+        if not self._closing_window:
+            if worker.error:
+                QMessageBox.critical(self, "导出失败", f"CSV文件写入失败：\n{worker.error}")
+            elif worker.cancelled:
+                self.statusBar().showMessage("导出已取消，未完成文件已删除", 5000)
+            else:
+                QMessageBox.information(self, "提示", f"{self._export_data_name}导出成功！")
+        worker.deleteLater()
 
     def closeEvent(self, event):
         """关闭窗口前停止采集、让设备休眠并释放串口。"""
+        self._closing_window = True
+        if self._export_worker is not None:
+            self._export_worker.requestInterruption()
+            self._export_worker.wait()
+            self._finish_csv_export()
         self._shutdown_device()
+        was_collecting = self.is_collecting
         self.is_collecting = False
         self.is_impedance_testing = False
         self.stop_impedance_test()
         self.stop_collection()
+        if was_collecting:
+            self._reset_subject_for_next_session()
         self.stats_timer.stop()
         self.ready_timer.stop()
         if self.alpha_model_dialog is not None:

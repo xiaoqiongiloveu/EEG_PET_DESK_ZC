@@ -184,6 +184,7 @@ class WirelessWindowTests(unittest.TestCase):
                 self.assertEqual((port.name, port.baudrate), ("COM7", 1000000))
                 window.AdsData.parse_data(bp_pack(BP_TYPE_STATUS, 1))
                 window._check_device_ready()
+                window.subject_info = {"kind": "person", "name": "测试者", "age": 30}
                 window.start_collect()
                 deadline = time.monotonic() + 2.0
                 while len(port.writes) < 5 and time.monotonic() < deadline:
